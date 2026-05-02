@@ -4,20 +4,8 @@
  * Client-side interface to request AI mentor insights.
  * Includes client-side caching for common position requests to save API calls.
  */
-import { MentorRequest, MentorMessageType, MentorContext } from '@/types/mentor';
-import { GoogleGenAI } from '@google/genai';
+import { MentorMessageType, MentorContext } from '@/types/mentor';
 import { CONSTANTS } from '@/config/constants';
-
-let aiInstance: GoogleGenAI | null = null;
-function getAI(): GoogleGenAI {
-  if (!aiInstance) {
-    if (!process.env.NEXT_PUBLIC_GEMINI_API_KEY) {
-      throw new Error("Missing NEXT_PUBLIC_GEMINI_API_KEY");
-    }
-    aiInstance = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
-  }
-  return aiInstance;
-}
 
 const SYSTEM_INSTRUCTION = `You are "Chessy", a magical wizard chess mentor for kids (age 6-14).
 Be extremely encouraging, enthusiastic, and keep explanations brief (1-3 sentences max).
@@ -42,11 +30,9 @@ export async function askMentor(
 
   try {
     // Fallback if offline
-    if (!navigator.onLine) {
+    if (typeof navigator !== 'undefined' && !navigator.onLine) {
       return getOfflineResponse(type);
     }
-
-    const ai = getAI();
 
     let userPrompt = `Current board FEN: ${context.fen}\nThe player is playing as ${context.playerColor === 'w' ? 'White' : 'Black'}. Player skill level: ${context.playerSkillLevel || 'Unknown'}.`;
 
@@ -75,19 +61,23 @@ export async function askMentor(
       }
     }
 
-    const response = await ai.models.generateContent({
-      model: CONSTANTS.MODELS.GEMINI_FLASH,
-      contents: userPrompt,
-      config: {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: CONSTANTS.MODELS.GEMINI_FLASH,
+        contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
         systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: 0.7,
-      },
+        config: {
+          temperature: 0.7,
+        },
+      }),
     });
 
-    let message = "Keep going! You're doing great!";
-    try {
-       message = response.text || message;
-    } catch(e) {}
+    if (!res.ok) throw new Error('API request failed');
+    const response = await res.json();
+
+    let message = response.text || "Keep going! You're doing great!";
     
     // Cache it
     if (cache.size >= maxCacheSize) {
