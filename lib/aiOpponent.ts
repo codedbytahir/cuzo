@@ -5,22 +5,9 @@
  * Includes fallback logic to select random moves if the AI fails or
  * depending on the difficulty level mistake rate.
  */
-import { Chess } from 'chess.js';
-import { GoogleGenAI } from '@google/genai';
+import { Chess, Move } from 'chess.js';
 import { CONSTANTS } from '@/config/constants';
 import { DifficultyLevel } from '@/types/opponent';
-
-let aiInstance: GoogleGenAI | null = null;
-
-function getAI(): GoogleGenAI {
-  if (!aiInstance) {
-    if (!process.env.NEXT_PUBLIC_GEMINI_API_KEY) {
-      throw new Error("Missing NEXT_PUBLIC_GEMINI_API_KEY");
-    }
-    aiInstance = new GoogleGenAI({ apiKey: process.env.NEXT_PUBLIC_GEMINI_API_KEY });
-  }
-  return aiInstance;
-}
 
 const SYSTEM_INSTRUCTION = `You are playing chess against a child (age 6-14).
 You should play at a beatable but fun level.
@@ -54,24 +41,24 @@ export async function getAIMove(fen: string, difficulty: DifficultyLevel): Promi
   try {
     console.log(`[AI Opponent] Requesting Gemini move for FEN: ${fen}`);
     
-    const ai = getAI();
     let moveText: string | undefined = undefined;
     
-    // Add 3s timeout or something to prevent game freezing forever
-    const responsePromise = ai.models.generateContent({
-      model: CONSTANTS.MODELS.GEMINI_FLASH,
-      contents: `Current FEN: ${fen}\nIt is your turn to play as ${game.turn() === 'w' ? 'White' : 'Black'}. What is your move?`,
-      config: {
+    const res = await fetch('/api/chat', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: CONSTANTS.MODELS.GEMINI_FLASH,
+        contents: [{ role: 'user', parts: [{ text: `Current FEN: ${fen}\nIt is your turn to play as ${game.turn() === 'w' ? 'White' : 'Black'}. What is your move?` }] }],
         systemInstruction: SYSTEM_INSTRUCTION,
-        temperature: difficulty === 'hard' ? 0.2 : 0.7,
-      },
+        config: {
+          temperature: difficulty === 'hard' ? 0.2 : 0.7,
+        },
+      }),
     });
 
-    const timeoutPromise = new Promise<{text: undefined}>((_, reject) => 
-      setTimeout(() => reject(new Error("Timeout")), 3000)
-    );
+    if (!res.ok) throw new Error('API request failed');
+    const response = await res.json();
 
-    const response = await Promise.race([responsePromise, timeoutPromise]) as any;
     try {
       moveText = response.text?.trim();
     } catch(e) {}
@@ -111,46 +98,70 @@ export async function getAIMove(fen: string, difficulty: DifficultyLevel): Promi
 }
 
 /**
- * Executes fallback rules:
- * 1. Defend attacked pieces
- * 2. Capture opponent pieces
- * 3. Develop pieces (knights before bishops)
- * 4. Castle
- * 5. Random
+ * Executes fallback rules with improved heuristics to avoid "bad moves":
+ * 1. Defend attacked pieces / Avoid moving into attack
+ * 2. Capture opponent pieces (highest value first)
+ * 3. Castle
+ * 4. Develop pieces
+ * 5. Safe random move
  */
 function getFallbackMove(game: Chess): string {
   const moves = game.moves({ verbose: true });
-  if (moves.length === 0) return ''; // No legal moves
+  if (moves.length === 0) return '';
 
-  // 1. Capture opponent piece
-  const captures = moves.filter(m => m.flags.includes('c') || m.flags.includes('e'));
+  const pieceValues: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
+
+  // Helper to check if a square is attacked by the opponent
+  const isSafe = (square: string) => {
+    // We need to switch turn to check if opponent attacks this square
+    const temp = new Chess(game.fen());
+    // chess.js doesn't have a direct 'isAttacked' for current turn,
+    // but it has 'isAttacked(square, color)'
+    const opponentColor = game.turn() === 'w' ? 'b' : 'w';
+    return !temp.isAttacked(square as any, opponentColor);
+  };
+
+  // 1. Captures (highest value first)
+  const captures = moves.filter(m => m.captured);
   if (captures.length > 0) {
-    // Sort captures by piece value
-    const pieceValues: Record<string, number> = { p: 1, n: 3, b: 3, r: 5, q: 9, k: 0 };
     captures.sort((a, b) => {
-      const aTarget = game.get(a.to);
-      const bTarget = game.get(b.to);
-      const aVal = aTarget ? pieceValues[aTarget.type] || 0 : 0;
-      const bVal = bTarget ? pieceValues[bTarget.type] || 0 : 0;
-      return bVal - aVal;
+      const valA = pieceValues[a.captured!] || 0;
+      const valB = pieceValues[b.captured!] || 0;
+      // If same value, prefer the one that ends on a safe square
+      if (valA === valB) {
+          return (isSafe(b.to) ? 1 : 0) - (isSafe(a.to) ? 1 : 0);
+      }
+      return valB - valA;
     });
-    return captures[0].from + captures[0].to + (captures[0].promotion ? captures[0].promotion : '');
+
+    // Take the best capture if it's reasonably safe or if we take something more valuable than what we lose
+    const bestCapture = captures[0];
+    const attackerPiece = game.get(bestCapture.from as any);
+    const attackerVal = attackerPiece ? pieceValues[attackerPiece.type] || 0 : 0;
+    const capturedVal = pieceValues[bestCapture.captured!] || 0;
+
+    if (isSafe(bestCapture.to) || capturedVal >= attackerVal) {
+        return bestCapture.from + bestCapture.to + (bestCapture.promotion || '');
+    }
   }
 
   // 2. Castle
-  const castlingMoves = moves.filter(m => m.flags.includes('k') || m.flags.includes('q'));
-  if (castlingMoves.length > 0) {
-    return castlingMoves[0].from + castlingMoves[0].to;
+  const castling = moves.filter(m => m.flags.includes('k') || m.flags.includes('q'));
+  if (castling.length > 0) return castling[0].from + castling[0].to;
+
+  // 3. Safe development/moves
+  const safeMoves = moves.filter(m => isSafe(m.to));
+  if (safeMoves.length > 0) {
+      // Prefer center control or forward moves
+      safeMoves.sort((a, b) => {
+          const distA = Math.abs(3.5 - 'abcdefgh'.indexOf(a.to[0])) + Math.abs(3.5 - (parseInt(a.to[1]) - 1));
+          const distB = Math.abs(3.5 - 'abcdefgh'.indexOf(b.to[0])) + Math.abs(3.5 - (parseInt(b.to[1]) - 1));
+          return distA - distB;
+      });
+      return safeMoves[0].from + safeMoves[0].to + (safeMoves[0].promotion || '');
   }
 
-  // 3. Develop pieces (N before B)
-  const knights = moves.filter(m => game.get(m.from)?.type === 'n' && (m.from.includes('1') || m.from.includes('8')));
-  if (knights.length > 0) return knights[0].from + knights[0].to;
-  
-  const bishops = moves.filter(m => game.get(m.from)?.type === 'b' && (m.from.includes('1') || m.from.includes('8')));
-  if (bishops.length > 0) return bishops[0].from + bishops[0].to;
-
-  // 4. Random move
+  // 4. Last resort: any legal move
   const move = moves[Math.floor(Math.random() * moves.length)];
-  return move.from + move.to + (move.promotion ? move.promotion : '');
+  return move.from + move.to + (move.promotion || '');
 }
